@@ -1,0 +1,16 @@
+name: mokiomind-video
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  # 1. 基础环境：Python 版本
+  - python=3.13
+  - pip  # 必须安装 pip 以处理后续包
+  
+  # 2. Python 包依赖 (使用 pip 安装以确保版本匹配)
+  - pip:
+    - numpy>=2.3.4
+    - pandas>=2.3.3
+    - torch>=2.9.0
+    - transformers>=4.57.1
+    
