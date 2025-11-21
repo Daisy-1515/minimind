@@ -1,3 +1,4 @@
+from ast import arg
 import math
 import torch
 import torch.nn as nn
@@ -236,3 +237,146 @@ def apply_rotary_pos_emb(
     k_embed = (k * cos) + (rotate_half(k) * sin)
     
     return q_embed, k_embed
+
+def repeat_kv(
+    x:torch.Tensor,
+    n_rep:int
+)->torch.Tensor:
+    """
+    """
+    bs,slen,num_key_value_heads,head_dim = x.shape
+    if n_rep == 1:
+        return x
+    
+    return (x[:,:,:,None,:]
+            .expand(bs,slen,num_key_value_heads,n_rep,head_dim)
+            .reshape(bs,slen,num_key_value_heads*n_rep,head_dim))
+
+
+
+
+class Attention(nn.Module):
+    def __init__(self, args: MokioMindConfig):
+        super().__init__()
+
+        # --- 1. 确定 KV 头数 (GQA/MQA 核心逻辑) ---
+        # 如果配置中没有指定 num_key_value_heads，则默认它等于 Q 的头数。
+        # - 相等 (32 vs 32): 标准多头注意力 (MHA)
+        # - 不等 (32 vs 8) : 分组查询注意力 (GQA)，能显著减少显存占用和推理延迟
+        self.num_key_value_heads = (
+            args.num_attention_heads
+            if args.num_key_value_heads is None
+            else args.num_key_value_heads
+        )
+
+        # --- 2. 维度合法性检查 ---
+        # 必须保证 Q 的头数能被 KV 头数整除，否则无法进行分组复制
+        # 例如：32 / 8 = 4 (合法); 32 / 5 (非法)
+        assert args.num_attention_heads % self.num_key_value_heads == 0
+
+        # --- 3. 记录核心维度参数 ---
+        self.n_local_heads = args.num_attention_heads      # Q 的头数 (Query Heads)
+        self.n_local_kv_heads = self.num_key_value_heads   # K/V 的头数 (KV Heads)
+        
+        # [关键] 计算重复次数 (Repetition Factor)
+        # 含义：每个 KV 头需要负责多少个 Q 头。
+        # 作用：在 forward 中，KV 需要被复制 (expand/repeat) n_rep 次以对齐 Q。
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        
+        # 计算单个头的维度 (例如: 4096 / 32 = 128维)
+        self.head_dim = args.hidden_size // args.num_attention_heads
+
+        # --- 4. 定义投影层 (Projections) ---
+        # Q 投影：全量参数，输入 hidden_size -> 输出 (头数 * 头维)
+        self.q_proj = nn.Linear(
+            args.hidden_size, args.num_attention_heads * self.head_dim, bias=False
+        )
+        
+        # K, V 投影：压缩参数 (GQA 特性)
+        # 输入 hidden_size -> 输出 (KV头数 * 头维)
+        # 如果 n_rep > 1，这里的参数矩阵比 q_proj 小很多，从而节省显存
+        self.k_proj = nn.Linear(
+            args.hidden_size, self.n_local_kv_heads * self.head_dim, bias=False
+        )
+        self.v_proj = nn.Linear(
+            args.hidden_size, self.n_local_kv_heads * self.head_dim, bias=False
+        )
+        
+        # 输出投影：将所有头的结果拼接后，映射回 hidden_size
+        self.o_proj = nn.Linear(
+            self.n_local_heads * self.head_dim, args.hidden_size, bias=False
+        )
+
+        # --- 5. Dropout 与 加速开关 ---
+        # 注意力矩阵的 Dropout (作用于 Softmax 之后)
+        self.attn_dropout = nn.Dropout(args.dropout)
+        
+        # 残差连接前的 Dropout (作用于 o_proj 输出之后)
+        self.resid_dropout = nn.Dropout(args.dropout)
+        
+        # 保存 float 类型的 dropout 概率，供 Flash Attention 的函数式接口使用
+        self.dropout = args.dropout
+        
+        # 检查是否启用 Flash Attention 且当前环境 (PyTorch 2.0+) 支持
+        self.flash = (
+            hasattr(torch.nn.functional, "scaled_dot_product_attention")
+            and args.flash_attention
+        )
+# class Attention(nn.Module):
+#     def __init__(self, args: MokioMindConfig):
+#         super().__init__()
+
+#         # --- 1. 初始化 KV 头数配置 (GQA 核心逻辑) ---
+#         # 逻辑：如果配置中未指定 num_key_value_heads (即为 None)，则默认它等于 num_attention_heads。
+#         # 效果：
+#         #   - 如果相等：退化为标准的 Multi-Head Attention (MHA)。
+#         #   - 如果不等（通常更小）：启用 Grouped Query Attention (GQA)。
+#         self.num_key_value_heads = args.num_attention_heads if args.num_key_value_heads is None else args.num_key_value_heads
+        
+#         # --- 2. 维度检查 [优化] ---
+#         # 检查 1: 隐藏层维度必须能被 Q 头数整除，算出 head_dim
+#         assert args.hidden_size % args.num_attention_heads == 0, "hidden_size must be divisible by num_attention_heads"
+#         # 检查 2: Q 头数必须能被 KV 头数整除 (这是 GQA 分组的前提)
+#         assert args.num_attention_heads % self.num_key_value_heads == 0, "num_attention_heads must be divisible by num_key_value_heads"
+       
+#         # --- 3. 核心参数设置 ---
+#         # Query (Q) 的头数
+#         self.n_local_heads = args.num_attention_heads
+        
+#         # Key/Value (K/V) 的头数
+#         self.n_local_kv_heads = self.num_key_value_heads
+        
+#         # 【关键点】计算重复次数 (Repetition Factor)
+#         # 含义：每个 KV 头对应多少个 Q 头。
+#         # 作用：在 forward 阶段，KV 需要在第 2 维度上复制 n_rep 次，以对齐 Q 的形状进行计算。
+#         self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        
+#         # 计算每个头的维度 (head_dim)
+#         self.head_dim = args.hidden_size // args.num_attention_heads
+        
+#         # --- 4. 定义线性投影层 (Linear Layers) ---
+#         # Q 的投影层：输出维度 = 总头数 * 头维度
+#         self.q_proj = nn.Linear(args.hidden_size, self.n_local_heads * self.head_dim, bias=False)
+        
+#         # K, V 的投影层：输出维度 = KV头数 * 头维度
+#         # [GQA优势]：当 n_local_kv_heads < n_local_heads 时，这里的参数量大幅减少。
+#         self.k_proj = nn.Linear(args.hidden_size, self.n_local_kv_heads * self.head_dim, bias=False)
+#         self.v_proj = nn.Linear(args.hidden_size, self.n_local_kv_heads * self.head_dim, bias=False)
+        
+#         # 输出投影层
+#         self.o_proj = nn.Linear(args.hidden_size, args.hidden_size, bias=False) 
+        
+#         # --- 5. Dropout 设置 [修复 Bug] ---
+#         # 原代码 bug：self.dropout 先被赋值为 nn.Dropout 对象，下一行又被赋值为 float 数值。
+#         # 修复：将概率值存为不同的变量名 (如 dropout_p)，避免覆盖 nn.Module。
+#         self.dropout = nn.Dropout(args.dropout)       # 这是一个 Layer (nn.Module)
+#         self.resid_dropout = nn.Dropout(args.dropout) # 这是一个 Layer
+#         self.dropout_p = args.dropout                 # [修复] 这是一个 float 数值，用于 functional 调用
+        
+#         # --- 6. Flash Attention 配置 [修复逻辑] ---
+#         # 原代码 bug：末尾多了一个 `and args`，这在 Python 中总是 True (对象本身)，没有意义且容易引起误解。
+#         # 修复：移除末尾多余部分。
+#         self.flash_attention = (
+#             args.flash_attention and 
+#             hasattr(torch.nn.functional, "scaled_dot_product_attention")
+#         )
