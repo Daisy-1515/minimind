@@ -1,9 +1,13 @@
 from ast import arg
+from filecmp import BUFSIZE
 import math
+import re
 import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 from typing import Optional, Tuple
+from torch.nn import functional as F
+from transformers.activations import ACT2FN
 
 # ==========================================
 # 1. 配置类 (Configuration)
@@ -253,16 +257,16 @@ def repeat_kv(
             .reshape(bs,slen,num_key_value_heads*n_rep,head_dim))
 
 
-
-
 class Attention(nn.Module):
     def __init__(self, args: MokioMindConfig):
         super().__init__()
 
         # --- 1. 确定 KV 头数 (GQA/MQA 核心逻辑) ---
-        # 如果配置中没有指定 num_key_value_heads，则默认它等于 Q 的头数。
-        # - 相等 (32 vs 32): 标准多头注意力 (MHA)
-        # - 不等 (32 vs 8) : 分组查询注意力 (GQA)，能显著减少显存占用和推理延迟
+        # 逻辑：决定 K 和 V 矩阵的维度。
+        # - num_key_value_heads == num_attention_heads : 标准多头注意力 (MHA)
+        # - num_key_value_heads < num_attention_heads  : 分组查询注意力 (GQA)
+        # - num_key_value_heads == 1                   : 多查询注意力 (MQA，GQA 的特例)
+        # GQA 能显著降低 KV Cache 显存占用，并提升推理吞吐量。
         self.num_key_value_heads = (
             args.num_attention_heads
             if args.num_key_value_heads is None
@@ -270,31 +274,37 @@ class Attention(nn.Module):
         )
 
         # --- 2. 维度合法性检查 ---
-        # 必须保证 Q 的头数能被 KV 头数整除，否则无法进行分组复制
-        # 例如：32 / 8 = 4 (合法); 32 / 5 (非法)
-        assert args.num_attention_heads % self.num_key_value_heads == 0
+        # Q 的头数必须是 KV 头数的整数倍，以保证每个 KV 头能对应固定数量的 Q 头（构成一个组）。
+        # 例：32 Q-heads / 8 KV-heads = 4 (每组 4 个 Q 共享 1 个 KV)
+        if args.num_attention_heads % self.num_key_value_heads != 0:
+            raise ValueError(
+                f"num_attention_heads ({args.num_attention_heads}) must be divisible by "
+                f"num_key_value_heads ({self.num_key_value_heads})"
+            )
 
         # --- 3. 记录核心维度参数 ---
         self.n_local_heads = args.num_attention_heads      # Q 的头数 (Query Heads)
-        self.n_local_kv_heads = self.num_key_value_heads   # K/V 的头数 (KV Heads)
+        self.n_local_kv_heads = self.num_key_value_heads   # K/V 的头数 (Key/Value Heads)
         
-        # [关键] 计算重复次数 (Repetition Factor)
-        # 含义：每个 KV 头需要负责多少个 Q 头。
-        # 作用：在 forward 中，KV 需要被复制 (expand/repeat) n_rep 次以对齐 Q。
+        # [关键] 计算重复/广播倍率 (Repetition Factor)
+        # 含义：每个 KV 头在计算 Attention Score 时需要匹配多少个 Q 头。
+        # 作用：在 forward 阶段，KV 需要在维度上扩展 (expand/repeat) n_rep 倍以对齐 Q 的形状。
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         
-        # 计算单个头的维度 (例如: 4096 / 32 = 128维)
+        # 计算单个头的维度 (Head Dimension)，例如: 4096 / 32 = 128 维
+        # 注意：通常 Q, K, V 的 head_dim 必须一致。
         self.head_dim = args.hidden_size // args.num_attention_heads
 
         # --- 4. 定义投影层 (Projections) ---
-        # Q 投影：全量参数，输入 hidden_size -> 输出 (头数 * 头维)
+        # Q 投影：全参数量。输入 hidden_size -> 输出 (Q头数 * 头维)
+        # bias=False 是 Llama 类模型的常见设置，通常为了适配 RoPE 位置编码。
         self.q_proj = nn.Linear(
             args.hidden_size, args.num_attention_heads * self.head_dim, bias=False
         )
         
         # K, V 投影：压缩参数 (GQA 特性)
         # 输入 hidden_size -> 输出 (KV头数 * 头维)
-        # 如果 n_rep > 1，这里的参数矩阵比 q_proj 小很多，从而节省显存
+        # 当 n_rep > 1 时，这里的参数矩阵显著小于 q_proj，从而减少模型总参数量。
         self.k_proj = nn.Linear(
             args.hidden_size, self.n_local_kv_heads * self.head_dim, bias=False
         )
@@ -302,26 +312,229 @@ class Attention(nn.Module):
             args.hidden_size, self.n_local_kv_heads * self.head_dim, bias=False
         )
         
-        # 输出投影：将所有头的结果拼接后，映射回 hidden_size
+        # 输出投影：将所有头的结果拼接 (Concat) 后，映射回 hidden_size
+        # 这里的输入维度与 Q 投影的输出维度一致（因为 Attention 输出形状跟随 Q）。
         self.o_proj = nn.Linear(
             self.n_local_heads * self.head_dim, args.hidden_size, bias=False
         )
 
         # --- 5. Dropout 与 加速开关 ---
-        # 注意力矩阵的 Dropout (作用于 Softmax 之后)
+        # Attention Matrix 的 Dropout：作用于 Softmax(QK^T) 之后，V 乘法之前。
         self.attn_dropout = nn.Dropout(args.dropout)
         
-        # 残差连接前的 Dropout (作用于 o_proj 输出之后)
+        # 残差路径的 Dropout：作用于 o_proj 之后，Residual Add 之前。
         self.resid_dropout = nn.Dropout(args.dropout)
         
-        # 保存 float 类型的 dropout 概率，供 Flash Attention 的函数式接口使用
+        # 保存 float 类型的 dropout 概率，供 SDPA 函数式接口直接使用
         self.dropout = args.dropout
         
-        # 检查是否启用 Flash Attention 且当前环境 (PyTorch 2.0+) 支持
+        # 检查是否启用 PyTorch 原生融合算子 (SDPA - Scaled Dot Product Attention)
+        # 只要 PyTorch 版本 > 2.0 且 args 开启，即可使用。
+        # 注意：SDPA 会根据硬件自动选择 Flash Attention (v2)、Memory Efficient Attention 或 Math 实现。
         self.flash = (
             hasattr(torch.nn.functional, "scaled_dot_product_attention")
             and args.flash_attention
         )
+        
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        past_K_V: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+        attention_mask: Optional[torch.Tensor] = None,       
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        # 计算 Q, K, V 矩阵
+        bsz,seq_len,_ = x.shape
+        xq,xk,xv = self.q_proj(x),self.k_proj(x),self.v_proj(x)
+        # 把输入拆分成多个头
+        xq = xq.view(bsz,seq_len,self.n_local_heads,self.head_dim)
+        xk = xk.view(bsz,seq_len,self.n_local_kv_heads,self.head_dim)
+        xv = xv.view(bsz,seq_len,self.n_local_kv_heads,self.head_dim)
+        # 应用 RoPE 位置编码
+        cos , sin = position_embeddings
+        xq,xk = apply_rotary_pos_emb(xq,xk,cos[:seq_len],sin[:seq_len])
+        # 对于k和v，进行重复以匹配q的头数
+        if past_K_V is not None:
+            past_k,past_v = past_K_V
+            xk = torch.cat([past_k,xk],dim=1)
+            xv = torch.cat([past_v,xv],dim=1)
+        
+        past_key_value = (xk,xv) if use_cache else None
+        
+        xq,xk,xv = (
+            
+            xq.transpose(1,2),  # [bsz, n_heads, seq_len, head_dim]
+            repeat_kv(xk,self.n_rep).transpose(1,2),  
+            repeat_kv(xv,self.n_rep).transpose(1,2)   # (B, Heads, Seq, Head_Dim)
+        )
+        
+        if self.flash:
+            output = F.scaled_dot_product_attention(
+                xq, xk, xv,
+                attn_mask=attention_mask,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=True
+            )
+        else:
+            scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+            causal_mask = torch.triu(
+                torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
+                diagonal=-1,
+            )
+
+            scores=scores+causal_mask.unsqueeze(0).unsqueeze(0)
+
+            if attention_mask is not None:
+                extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
+                scores = scores + extended_attention_mask
+
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            scores=self.attn_dropout(scores)
+            output=scores@xv
+        # bsz,seq_len,n_heads,head_dim
+        output=output.transpose(1,2).reshape(bsz,seq_len,-1)
+        output=self.resid_dropout(self.o_proj(output))
+
+
+
+        return output,past_key_value
+
+
+class FeedForward(nn.Module):
+    
+    #初始化
+    #升维度
+    #降维
+    #门控
+    #dropout
+    #激活函数
+    def __init__(self, args: MokioMindConfig):
+        super().__init__()
+        if args.intermediate_size is None:
+            intermediate_size = int(args.hidden_size * 8 / 3) #默认8/3倍升维
+            args.intermediate_size = 64*((intermediate_size +64-1)//64  ) #向上取64的倍数
+            
+            self.up_proj = nn.Linear(args.hidden_size,args.intermediate_size,bias=False)
+            self.down_proj = nn.Linear(args.intermediate_size,args.hidden_size,bias=False)
+            self.gate_proj = nn.Linear(args.hidden_size,args.intermediate_size,bias=False) 
+            self.dropout = nn.Dropout(args.dropout) #dropout层
+            self.act_fn = ACT2FN[args.hidden_act]  #激活函数
+    def forward(self,x:torch.Tensor)->torch.Tensor:
+        return self.dropout(
+            self.down_proj(
+                self.act_fn(self.up_proj(x))*self.gate_proj(x)
+            )
+        )
+
+class MokioMindBlock(nn.Module):
+    def __init__(self, layer_id:int ,config:MokioMindConfig):
+        super().__init__()
+        self.num_attention_heads = config.num_attention_heads
+        self.hidden_size = config.hidden_size
+        self.head_dim = self.hidden_size // self.num_attention_heads
+        self.self_attn = Attention(config)
+        
+        self.layer_id = layer_id
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = FeedForward(config)
+    
+    def forward(self,
+                hidden_states:torch.Tensor,
+                position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+                past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] =None,
+                use_cache: bool = False,
+                attention_mask: Optional[torch.Tensor] = None,
+                )->Tuple[torch.Tensor,Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        
+        hidden_states, present_key_value = self.self_attn(
+            hidden_states,
+            position_embeddings,
+            past_K_V=past_key_value,
+            use_cache=use_cache,
+            attention_mask=attention_mask,
+        )
+        hidden_states = residual + hidden_states
+        
+        
+        
+        
+        
+        
+        
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = residual + self.mlp(self.post_attention_layernorm(hidden_states))
+
+        return hidden_states, present_key_value
+    
+    
+    
+        
+
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
 # class Attention(nn.Module):
 #     def __init__(self, args: MokioMindConfig):
 #         super().__init__()
