@@ -18,8 +18,9 @@ MokioMind 语言模型实现
 # ==========================================
 from ast import arg
 from filecmp import BUFSIZE
+from functools import wraps
 from logging import config
-import math  # 数学运算库
+import math
 import re
 from turtle import forward
 
@@ -29,95 +30,206 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 # Hugging Face Transformers 库
-from transformers import GenerationMixin, PreTrainedModel, PretrainedConfig
-from transformers.activations import ACT2FN  # 激活函数映射字典 {"silu": SiLU(), "gelu": GELU(), ...}
+from transformers import (
+    ClvpForCausalLM,           # 因果语言模型基类
+    GenerationMixin,           # 文本生成混入类
+    PreTrainedModel,           # 预训练模型基类
+    PretrainedConfig           # 配置基类
+)
+from transformers.activations import ACT2FN  # 激活函数映射字典
+from transformers.modeling_outputs import CausalLMOutputWithPast  # 模型输出格式
 
 # 类型注解
 from typing import Optional, Tuple, List, Union
 
-# 自定义模块
-from method import rope  # RoPE 位置编码实现
 
 # ==========================================
 # 1. 配置类 (Configuration)
 # ==========================================
 class MokioMindConfig(PretrainedConfig):
-    """
-    MokioMind 模型配置类
-
-    继承自 Hugging Face PretrainedConfig，用于存储模型的所有超参数。
-    支持自动序列化/反序列化，可与 Hugging Face Hub 无缝集成。
-
-    主要参数分类：
-    1. 基础训练参数：dropout
-    2. 特殊 Token：bos_token_id, eos_token_id
-    3. 模型架构：hidden_size, num_layers, num_heads 等
-    4. 位置编码：rope_base, max_position_embeddings
-    5. 性能优化：flash_attention
-    6. MoE 专家混合：use_moe, num_experts 等
-
-    使用示例：
-        >>> config = MokioMindConfig(hidden_size=768, num_attention_heads=12)
-        >>> model = MokioMindForCausalLM(config)
-    """
-    model_type = "mokiomind"  # 模型类型标识符，用于 Hugging Face Hub 注册
+    model_type = "mokiomind"
 
     def __init__(
         self,
         # ============ 基础训练参数 ============
-        dropout: float = 0.0,  # Dropout 概率，用于防止过拟合（0.0=不使用，0.1-0.3=常见训练值）
+        dropout: float = 0.0,
+        """Dropout 概率，用于防止过拟合
+        - 0.0: 不使用 dropout（推理时）
+        - 0.1-0.3: 常见训练值
+        """
 
         # ============ 特殊 Token ID ============
-        bos_token_id: int = 1,  # 序列开始标记 (Begin Of Sentence)，用于标识输入起始
-        eos_token_id: int = 2,  # 序列结束标记 (End Of Sentence)，生成此 token 时停止
+        bos_token_id: int = 1,
+        """序列开始标记 (Begin Of Sentence)
+        - 用于标识输入序列的起始位置
+        - 通常在生成任务中作为第一个 token
+        """
+
+        eos_token_id: int = 2,
+        """序列结束标记 (End Of Sentence)
+        - 用于标识生成结束
+        - 模型生成此 token 时停止生成
+        """
 
         # ============ 模型架构参数 ============
-        hidden_act: str = "silu",  # 激活函数类型："silu"(Swish)/"gelu"(BERT常用)/"relu"(传统)
+        hidden_act: str = "silu",
+        """隐藏层激活函数类型
+        - "silu": Sigmoid Linear Unit (Swish)，平滑且性能优秀
+        - "gelu": Gaussian Error Linear Unit，BERT 等模型常用
+        - "relu": 传统 ReLU，计算简单但可能梯度消失
+        """
 
-        hidden_size: int = 512,  # 模型隐藏层维度，决定表达能力（512=小模型, 768=BERT-base, 4096=Llama-7B）
-        intermediate_size: Optional[int] = None,  # FFN 中间层维度，None 时自动计算为 hidden_size*8/3 向上取64倍数
-        max_position_embeddings: int = 32768,  # 最大序列长度（32K tokens ≈ 24K 英文单词）
-        num_attention_heads: int = 8,  # Query 注意力头数，必须能被 num_key_value_heads 整除
-        num_hidden_layers: int = 8,  # Transformer 层数，决定模型深度（6-12=小模型, 24=BERT-large, 32=Llama-7B）
-        num_key_value_heads: int = 2,  # KV 注意力头数，用于 GQA（<num_attention_heads 时启用分组查询）
+        hidden_size: int = 512,
+        """模型隐藏层维度 (Embedding Size / Model Dimension)
+        - 决定了模型的表达能力
+        - 常见值: 512 (小模型), 768 (BERT-base), 4096 (Llama-7B)
+        - 必须能被 num_attention_heads 整除
+        """
+
+        intermediate_size: Optional[int] = None,
+        """前馈神经网络 (FFN) 的中间层维度
+        - 若为 None，自动计算为 hidden_size * 8/3 并向上取 64 的倍数
+        - 通常是 hidden_size 的 2.67-4 倍
+        - 例: hidden_size=512 → intermediate_size≈1365 → 向上取整为 1408
+        """
+
+        max_position_embeddings: int = 32768,
+        """最大位置编码长度 (上下文窗口大小)
+        - 决定模型能处理的最大序列长度
+        - 32768 = 32K tokens，约 24K 英文单词
+        - 训练时序列长度不能超过此值
+        """
+
+        num_attention_heads: int = 8,
+        """Query 的注意力头数量
+        - 多头注意力机制的核心参数
+        - 必须能被 num_key_value_heads 整除（GQA 要求）
+        - 常见值: 8 (小模型), 12 (BERT-base), 32 (Llama-7B)
+        """
+
+        num_hidden_layers: int = 8,
+        """Transformer 层数 (模型深度)
+        - 决定模型的层次表达能力
+        - 常见值: 6-12 (小模型), 24 (BERT-large), 32 (Llama-7B)
+        - 层数越多，模型越深，但训练越慢
+        """
+
+        num_key_value_heads: int = 2,
+        """Key 和 Value 的注意力头数量 (GQA/MQA 核心参数)
+        - 用于实现分组查询注意力 (Grouped Query Attention)
+        - num_key_value_heads < num_attention_heads: GQA 模式
+        - num_key_value_heads = 1: MQA (Multi-Query Attention) 模式
+        - num_key_value_heads = num_attention_heads: 标准 MHA 模式
+        - 优势: 显著减少 KV Cache 显存占用，提升推理吞吐量
+        """
 
         # ============ 词表参数 ============
-        vocab_size: int = 6400,  # 词表大小，决定可识别的 token 数量（32K=Llama, 50K=GPT-2）
+        vocab_size: int = 6400,
+        """词表大小 (Vocabulary Size)
+        - 决定模型能识别的 token 数量
+        - 常见值: 32000 (Llama), 50257 (GPT-2), 250000+ (大词表)
+        - 影响 Embedding 层和输出层的参数量
+        """
 
         # ============ 归一化参数 ============
-        rms_norm_eps: float = 1e-05,  # RMSNorm 的 epsilon 值，防止除零（通常 1e-5 或 1e-6）
+        rms_norm_eps: float = 1e-05,
+        """RMS Normalization 的 epsilon 值
+        - 用于防止除零错误，保持数值稳定性
+        - 通常设为 1e-5 或 1e-6
+        - 值越小，归一化越精确，但数值稳定性越差
+        """
 
         # ============ 位置编码参数 ============
-        rope_base: float = 1e6,  # RoPE 基频参数 theta（1e6=超长上下文, 1e4=原始论文值）
-        inference_rope_scaling: bool = False,  # 是否启用 YaRN 缩放，支持超过训练长度的推理
+        rope_base: float = 1e6,
+        """RoPE (旋转位置编码) 的基频参数 (theta)
+        - 控制位置编码的频率范围
+        - 1e6 (100万): 支持超长上下文
+        - 1e4 (1万): 原始 RoPE 论文值
+        - 值越大，支持的上下文越长
+        """
+
+        inference_rope_scaling: bool = False,
+        """是否在推理时启用 RoPE 缩放 (长文本外推)
+        - True: 启用 YaRN 缩放，支持超过训练长度的推理
+        - False: 使用标准 RoPE，推理长度不超过 max_position_embeddings
+        - 用于处理超长文本场景
+        """
 
         # ============ 性能优化参数 ============
-        flash_attention: bool = True,  # 是否启用 Flash Attention（需 PyTorch>=2.0，2-4x 加速）
+        flash_attention: bool = True,
+        """是否启用 Flash Attention 加速
+        - True: 使用 PyTorch 的 scaled_dot_product_attention
+        - 自动选择最优实现: Flash Attention v2 / Memory Efficient / Math
+        - 优势: 2-4x 加速，节省显存
+        - 要求: PyTorch >= 2.0
+        """
 
         # ============ MoE (Mixture of Experts) 参数 ============
-        use_moe: bool = False,  # 是否启用混合专家模型（提升容量但保持计算量）
-        num_experts_per_tok: int = 2,  # 每个 token 激活的专家数（通常为2，平衡性能和计算）
-        n_routed_experts: int = 4,  # 可路由的专家总数（常见值: 4, 8, 16, 64）
-        n_shared_experts: int = 1,  # 共享专家数（所有 token 都经过，学习通用特征）
-        scoring_func: str = 'softmax',  # 专家选择评分函数（"softmax"=概率分布, "sigmoid"=独立评分）
-        aux_loss_alpha: float = 0.1,  # 辅助损失权重，用于平衡专家负载
-        seq_aux: bool = True,  # 是否使用序列级辅助损失（True=整个序列, False=每个token独立）
-        norm_topk_prob: bool = True,  # 是否归一化 top-k 专家概率（True=重新归一化权重）
+        use_moe: bool = False,
+        """是否启用混合专家模型
+        - True: 使用 MoE 架构，提升模型容量但保持计算量
+        - False: 使用标准 FFN
+        """
+
+        num_experts_per_tok: int = 2,
+        """每个 token 激活的专家数量
+        - 通常为 2，平衡性能和计算量
+        - 值越大，计算量越大，但表达能力越强
+        """
+
+        n_routed_experts: int = 4,
+        """可路由的专家总数
+        - 实际专家数量
+        - 常见值: 4, 8, 16, 64
+        """
+
+        n_shared_experts: int = 1,
+        """共享专家数量
+        - 所有 token 都会经过的专家
+        - 用于学习通用特征
+        """
+
+        scoring_func: str = 'softmax',
+        """专家选择的评分函数
+        - "softmax": 标准 softmax，输出概率分布
+        - "sigmoid": 独立评分，允许多专家激活
+        """
+
+        aux_loss_alpha: float = 0.1,
+        """辅助损失权重
+        - 用于平衡专家负载
+        - 防止某些专家过度使用
+        """
+
+        seq_aux: bool = True,
+        """是否使用序列级辅助损失
+        - True: 在整个序列上计算负载平衡
+        - False: 在每个 token 上独立计算
+        """
+
+        norm_topk_prob: bool = True,
+        """是否归一化 top-k 专家的概率
+        - True: 重新归一化选中专家的权重
+        - False: 使用原始 softmax 输出
+        """
+
         **kwargs,
     ):
         """
-        初始化 MokioMind 配置
+        MokioMind 模型配置类
 
-        参数说明：
-            dropout: Dropout 概率，0.0 表示不使用
-            hidden_size: 模型维度，必须能被 num_attention_heads 整除
-            num_attention_heads: Query 头数，必须能被 num_key_value_heads 整除
-            num_key_value_heads: KV 头数，实现 GQA 以减少显存占用
+        继承自 Hugging Face PretrainedConfig，支持：
+        - 自动序列化/反序列化
+        - 与 Hugging Face Hub 集成
+        - 配置验证和默认值管理
 
-        注意事项：
-            - hidden_size 必须能被 num_attention_heads 整除
-            - num_attention_heads 必须能被 num_key_value_heads 整除
-            - intermediate_size 为 None 时会自动计算
+        使用示例:
+            >>> config = MokioMindConfig(
+            ...     hidden_size=768,
+            ...     num_attention_heads=12,
+            ...     num_hidden_layers=12
+            ... )
+            >>> model = MokioMindForCausalLM(config)
         """
         super().__init__(**kwargs)
 
@@ -678,13 +790,13 @@ class MokioMindModel(nn.Module):
         # ):
 
         # 修复：重命名循环变量避免覆盖外部变量，使用类型安全的列表
-        for layer_idx , (layer , past_kv) in enumerate(
+        for layer_idx , (layer , past_key_value) in enumerate(
             zip(self.layers , past_key_values_list)
         ):
             hidden_states , present = layer(
                 hidden_states,
                 position_embeddings,
-                past_key_value = past_kv,  # 修复：使用正确的参数名
+                past_key_value = past_key_value,  # 修复：使用正确的参数名
                 use_cache = use_cache,
                 attention_mask = attention_mask,
             )
@@ -702,28 +814,50 @@ class MokioMindModel(nn.Module):
         
 
         
-        
-        
-        
-    
-    
-    
-    
-    
-    
+
 class MokioMindForCausalLM(PreTrainedModel,GenerationMixin): #hug定义的标准类
     config_class = MokioMindConfig
     
     def __init__(self,config:MokioMindConfig):
         self.config = config
-        
         super().__init__(config)
-        
         self.model = MokioMindModel(config)
+        self.lm_head = nn.Linear(
+        self.config.hidden_size , self.config.vocab_size , bias = False
+        )
+        #输出层和嵌入层(单词变成向量的嵌入)的权重共享
+        self.model.embed_tokens.weight = self.lm_head.weight
+        self.OUT = CausalLMOutputWithPast()
         
+    def forward(self,
+                input_ids:Optional[torch.Tensor]=None,
+                attention_mask:Optional[torch.Tensor]=None,
+                past_key_values:Optional[List[Optional[Tuple[torch.Tensor, torch.Tensor]]]]=None,
+                use_cache:bool = False,
+                logits_to_keep: Union[int, torch.Tensor] = 0,
+                **args
+        ):
         
+        hidden_states, past_key_values = self.model(
+            input_ids = input_ids,
+            attention_mask = attention_mask,
+            past_key_values = past_key_values,
+            use_cache = use_cache,
+            **args
+        )
         
-    
+        slice_indices = (
+            slice(-logits_to_keep,None) 
+            if isinstance(logits_to_keep,int) 
+            else logits_to_keep
+            )
+
+        logits = self.lm_head(hidden_states[:,slice_indices,:])
+        self.OUT.__setitem__("last_hidden_state" , hidden_states)
+        self.OUT.__setitem__("logits" , logits)
+        self.OUT.__setitem__("past_key_values" , past_key_values)
+        
+        return self.OUT
     
     
     
