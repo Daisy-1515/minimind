@@ -1,13 +1,17 @@
 from ast import arg
 from filecmp import BUFSIZE
+from logging import config
 import math
 import re
+from turtle import forward
 import torch
 import torch.nn as nn
-from transformers import PretrainedConfig
-from typing import Optional, Tuple
+from transformers import GenerationMixin, PreTrainedModel, PretrainedConfig
+from typing import Optional, Tuple, List, Union  # 添加 List 和 Union 类型
 from torch.nn import functional as F
 from transformers.activations import ACT2FN
+
+from method import rope
 
 # ==========================================
 # 1. 配置类 (Configuration)
@@ -17,21 +21,28 @@ class MokioMindConfig(PretrainedConfig):
 
     def __init__(
         self,
-        dropout: float = 0.0,
-        bos_token_id: int = 1,
-        eos_token_id: int = 2,
-        hidden_act: str = "silu",
-        hidden_size: int = 512,
-        intermediate_size: Optional[int] = None,
-        max_position_embeddings: int = 32768,
-        num_attention_heads: int = 8,
-        num_hidden_layers: int = 8,
-        num_key_value_heads: int = 2,
-        vocab_size: int = 6400,
-        rms_norm_eps: float = 1e-05,
-        rope_base: float = 1e6,  # 对应 rope_theta
-        inference_rope_scaling: bool = False,
-        flash_attention: bool = True,
+        dropout: float = 0.0,                  # Dropout 概率（用于防止过拟合，0.0 表示不使用）
+        
+        bos_token_id: int = 1,                 # 序列开始 (Begin Of Sentence) token 的 ID
+        eos_token_id: int = 2,                 # 序列结束 (End Of Sentence) token 的 ID
+        
+        hidden_act: str = "silu",              # 隐藏层激活函数类型 (通常为 "silu" 或 "gelu")
+        
+        hidden_size: int = 512,                # 模型隐藏层的维度大小 (Embedding Size)
+        intermediate_size: Optional[int] = None, # 前馈神经网络 (FFN) 的中间层维度 (若为 None，通常会自动计算)
+        max_position_embeddings: int = 32768,  # 最大位置编码长度 (即模型支持的最大上下文窗口大小)
+        num_attention_heads: int = 8,          # 注意力头 (Attention Heads) 的总数量 (针对 Query)
+        num_hidden_layers: int = 8,            # Transformer Encoder/Decoder 的层数 (模型深度)
+        num_key_value_heads: int = 2,          # Key 和 Value 的注意力头数量 (用于 GQA/MQA，通常小于 num_attention_heads)
+        
+        vocab_size: int = 6400,                # 词表大小 (Vocabulary Size)
+        
+        rms_norm_eps: float = 1e-05,           # RMS Normalization 的 epsilon 值 (用于防止除零，保持数值稳定性)
+        
+        rope_base: float = 1e6,                # RoPE (旋转位置编码) 的基频参数 (通常对应 rope_theta)
+        inference_rope_scaling: bool = False,  # 是否在推理阶段应用 RoPE 线性/动态缩放 (用于长文本外推)
+        
+        flash_attention: bool = True,          # 是否启用 Flash Attention 加速 (显存优化与加速计算)
         
         # ============ MoE 参数 ============
         use_moe: bool = False,
@@ -143,7 +154,7 @@ class RMSNorm(nn.Module):
 def precompute_freqs_cis(
     dim: int,
     end: int = 32 * 1024, 
-    rope_theta: float = 1000000.0,
+    rope_base: float = 1000000.0,
     rope_scaling: Optional[dict] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -152,7 +163,7 @@ def precompute_freqs_cis(
     """
     # 1. 计算基础频率 theta_i = base^(-2i/d)
     # shape: (dim/2)
-    freqs = 1.0 / (rope_theta ** (torch.arange(0, dim, 2)[:(dim//2)].float() / dim))
+    freqs = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[:(dim//2)].float() / dim))
 
     # 2. 如果配置了 rope_scaling (YaRN)，则调整频率
     if rope_scaling is not None:
@@ -371,20 +382,32 @@ class Attention(nn.Module):
         
         if self.flash:
             output = F.scaled_dot_product_attention(
-                xq, xk, xv,
+                xq, 
+                xk, 
+                xv,
                 attn_mask=attention_mask,
                 dropout_p=self.dropout if self.training else 0.0,
                 is_causal=True
             )
         else:
+            # 手动实现 Scaled Dot-Product Attention
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
+            # 原代码：
+            # causal_mask = torch.triu(
+            #     torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
+            #     diagonal=-1,
+            # )
+
+            # 修复：diagonal 应该为 1（保留对角线及以下），而非 -1
+            # torch.triu(diagonal=1) 会将对角线上方的元素设为 -inf，实现因果掩码
+            kv_seq_len = xk.shape[2]  # KV 的序列长度（可能因为 KV cache 而大于 seq_len）
             causal_mask = torch.triu(
-                torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
-                diagonal=-1,
+                torch.full((seq_len, kv_seq_len), float("-inf"), device=scores.device, dtype=scores.dtype),
+                diagonal=1,  # 修复：从 -1 改为 1
             )
 
-            scores=scores+causal_mask.unsqueeze(0).unsqueeze(0)
+            scores = scores + causal_mask.unsqueeze(0).unsqueeze(0)
 
             if attention_mask is not None:
                 extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
@@ -392,8 +415,8 @@ class Attention(nn.Module):
                 scores = scores + extended_attention_mask
 
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-            scores=self.attn_dropout(scores)
-            output=scores@xv
+            scores = self.attn_dropout(scores)
+            output = scores @ xv
         # bsz,seq_len,n_heads,head_dim
         output=output.transpose(1,2).reshape(bsz,seq_len,-1)
         output=self.resid_dropout(self.o_proj(output))
@@ -404,28 +427,49 @@ class Attention(nn.Module):
 
 
 class FeedForward(nn.Module):
-    
-    #初始化
-    #升维度
-    #降维
-    #门控
-    #dropout
-    #激活函数
+    """
+    前馈神经网络层 (Feed-Forward Network)
+    使用 SwiGLU 激活函数：gate(x) * up(x)
+    """
+    # 初始化
+    # 升维度
+    # 降维
+    # 门控
+    # dropout
+    # 激活函数
     def __init__(self, args: MokioMindConfig):
         super().__init__()
+
+        # 原代码：
+        # if args.intermediate_size is None:
+        #     intermediate_size = int(args.hidden_size * 8 / 3)
+        #     args.intermediate_size = 64*((intermediate_size +64-1)//64)
+        #
+        #     self.up_proj = nn.Linear(args.hidden_size,args.intermediate_size,bias=False)
+        #     ...
+
+        # 修复：缩进错误，投影层应该在 if 外部定义，确保无论 intermediate_size 是否为 None 都能初始化
         if args.intermediate_size is None:
-            intermediate_size = int(args.hidden_size * 8 / 3) #默认8/3倍升维
-            args.intermediate_size = 64*((intermediate_size +64-1)//64  ) #向上取64的倍数
-            
-            self.up_proj = nn.Linear(args.hidden_size,args.intermediate_size,bias=False)
-            self.down_proj = nn.Linear(args.intermediate_size,args.hidden_size,bias=False)
-            self.gate_proj = nn.Linear(args.hidden_size,args.intermediate_size,bias=False) 
-            self.dropout = nn.Dropout(args.dropout) #dropout层
-            self.act_fn = ACT2FN[args.hidden_act]  #激活函数
-    def forward(self,x:torch.Tensor)->torch.Tensor:
+            intermediate_size = int(args.hidden_size * 8 / 3)  # 默认8/3倍升维
+            args.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)  # 向上取64的倍数
+
+        # 确保 intermediate_size 已设置
+        assert args.intermediate_size is not None, "intermediate_size must be set"
+
+        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
+        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.dropout = nn.Dropout(args.dropout)  # dropout层
+        self.act_fn = ACT2FN[args.hidden_act]  # 激活函数
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        前向传播：SwiGLU 激活
+        公式：dropout(down(act(up(x)) * gate(x)))
+        """
         return self.dropout(
             self.down_proj(
-                self.act_fn(self.up_proj(x))*self.gate_proj(x)
+                self.act_fn(self.up_proj(x)) * self.gate_proj(x)
             )
         )
 
@@ -449,9 +493,14 @@ class MokioMindBlock(nn.Module):
                 use_cache: bool = False,
                 attention_mask: Optional[torch.Tensor] = None,
                 )->Tuple[torch.Tensor,Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        """
+        Transformer Block 前向传播
+        使用 Pre-Norm 架构：Norm -> Attention/FFN -> Residual
+        """
+        # === Attention 子层 ===
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        
+
         hidden_states, present_key_value = self.self_attn(
             hidden_states,
             position_embeddings,
@@ -459,19 +508,161 @@ class MokioMindBlock(nn.Module):
             use_cache=use_cache,
             attention_mask=attention_mask,
         )
+        
         hidden_states = residual + hidden_states
-        
-        
-        
-        
-        
-        
-        
+
+        # === FFN 子层 ===
+        # 原代码：
+        # residual = hidden_states
+        # hidden_states = self.post_attention_layernorm(hidden_states)
+        # hidden_states = residual + self.mlp(self.post_attention_layernorm(hidden_states))
+
+        # 修复：重复调用了 post_attention_layernorm，应该只调用一次
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        # hidden_states = residual + self.mlp(hidden_states)  # 修复：移除重复的 layernorm 调用
         hidden_states = residual + self.mlp(self.post_attention_layernorm(hidden_states))
-
         return hidden_states, present_key_value
+    
+    
+    
+class MokioMindModel(nn.Module):
+    def __init__(self, config:MokioMindConfig):
+        super().__init__()
+        self.vocab_size , self.num_hidden_layers = (
+            config.vocab_size,
+            config.num_hidden_layers
+        )
+        
+        self.embed_tokens = nn.Embedding(config.vocab_size,config.hidden_size)
+        
+        self.droppout = nn.Dropout(config.dropout)
+        
+        self.layers = nn.ModuleList(
+            [MokioMindBlock(i,config) for i in range(self.num_hidden_layers)]
+        )
+        
+        self.norm = RMSNorm(config.hidden_size , eps = config.rms_norm_eps)
+        
+        freqs_cos , freqs_sin = precompute_freqs_cis(
+            dim = config.hidden_size // config.num_attention_heads,
+            end = config.max_position_embeddings,
+            rope_base = config.rope_base,
+            rope_scaling=config.rope_scaling,
+        )
+        self.freqs_cos: torch.Tensor 
+        self.freqs_sin: torch.Tensor
+        self.register_buffer("freqs_cos",freqs_cos,persistent=False)
+        self.register_buffer("freqs_sin",freqs_sin,persistent=False)
+        
+    def forward(
+        self,
+        input_ids:Optional[torch.Tensor]=None,
+        attention_mask:Optional[torch.Tensor]=None,
+        past_key_values:Optional[List[Optional[Tuple[torch.Tensor, torch.Tensor]]]]=None,  # 修复类型：使用 List 而非 Tuple
+        use_cache:bool = False,
+        **kwargs  #其他类的定义由这个接收
+    ):
+
+        if input_ids is None:
+            raise ValueError("input_ids cannot be None for forward pass.")
+
+
+        batch_size , seq_len = input_ids.shape
+
+        # 原代码：
+        # if hasattr(past_key_values,'layers'):
+        #     past_key_values = None
+
+        # 修复：添加类型检查，确保 past_key_values 是正确的类型
+        if past_key_values is not None and hasattr(past_key_values, 'layers'):
+            past_key_values = None
+
+        # 原代码：
+        # if past_key_values is None:
+        #     past_key_values = [None] * len(self.layers)
+
+        # 修复：使用类型安全的方式初始化
+        past_key_values_list: List[Optional[Tuple[torch.Tensor, torch.Tensor]]]
+        if past_key_values is None:
+            # 显式构造一个长度为层数的列表，初始全为 None
+            past_key_values_list = [None for _ in range(len(self.layers))]
+        else:
+            past_key_values_list = past_key_values
+
+
+        start_pos = 0
+        # 原代码：
+        # if past_key_values[0] is not None:
+        #      start_pos = past_key_values[0][0].shape[2]
+
+        # 修复：添加类型守卫，确保 past_key_values_list 不为空且第一个元素存在
+        if len(past_key_values_list) > 0 and past_key_values_list[0] is not None:
+             # past_key_values_list[0][0] 是 Key 矩阵: [Batch, Heads, SeqLen, Dim]
+             start_pos = past_key_values_list[0][0].shape[2] # 注意维度索引通常是 2 (seq_len)
+
+        hidden_states = self.droppout(self.embed_tokens(input_ids))
+
+        position_embeddings = (
+            self.freqs_cos[start_pos:start_pos+seq_len],
+            self.freqs_sin[start_pos:start_pos+seq_len],
+        )
+
+        presents: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = []  # 添加类型注解
+
+
+        # 原代码：
+        # for layer_idx , (layer , past_key_values) in enumerate(
+        #     zip(self.layers , past_key_values)
+        # ):
+
+        # 修复：重命名循环变量避免覆盖外部变量，使用类型安全的列表
+        for layer_idx , (layer , past_kv) in enumerate(
+            zip(self.layers , past_key_values_list)
+        ):
+            hidden_states , present = layer(
+                hidden_states,
+                position_embeddings,
+                past_key_value = past_kv,  # 修复：使用正确的参数名
+                use_cache = use_cache,
+                attention_mask = attention_mask,
+            )
+
+            presents.append(present)
+
+
+        hidden_states = self.norm(hidden_states)
+
+        return hidden_states , presents
+    
+    
+        
+        
+        
+
+        
+        
+        
+        
+    
+    
+    
+    
+    
+    
+class MokioMindForCausalLM(PreTrainedModel,GenerationMixin): #hug定义的标准类
+    config_class = MokioMindConfig
+    
+    def __init__(self,config:MokioMindConfig):
+        self.config = config
+        
+        super().__init__(config)
+        
+        self.model = MokioMindModel(config)
+        
+        
+        
+    
     
     
     
