@@ -283,32 +283,68 @@ def apply_rotary_pos_emb(
     unsqueeze_dim: int = 1
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    在前向传播中实际应用 RoPE。
+    应用旋转位置编码 (Rotary Position Embedding, RoPE) 到查询和键张量。
+
+    RoPE 通过旋转变换将位置信息编码到注意力机制中,相比传统的绝对位置编码:
+    - 能够自然地表达相对位置关系
+    - 对序列长度具有更好的外推能力
+    - 计算效率高,仅需逐元素乘法和加法
     
     参数:
-        q, k: (Batch, Seq_Len, Head, Dim)
-        cos, sin: (Seq_Len, Dim) - 来自 precompute_freqs_cis
-        unsqueeze_dim: 用于广播 cos/sin 的维度，通常为 1 (Head 维度) 或 0 (Batch 维度)
+        q: 查询张量,形状 (Batch, Seq_Len, Head, Dim)
+        k: 键张量,形状 (Batch, Seq_Len, Head, Dim)
+        cos: 预计算的余弦值,形状 (Seq_Len, Dim),来自 precompute_freqs_cis
+        sin: 预计算的正弦值,形状 (Seq_Len, Dim),来自 precompute_freqs_cis
+        unsqueeze_dim: 用于广播 cos/sin 的维度索引
+                       - 1: 在 Head 维度插入,适用于 (Batch, Seq, Head, Dim) 布局
+                       - 0: 在 Batch 维度插入,适用于其他布局
+
+    返回:
+        (q_embed, k_embed): 应用 RoPE 后的查询和键张量,形状与输入相同
     """
     
     def rotate_half(x):
         """
-        将 x 切分为两半: x1, x2
-        返回: [-x2, x1]
-        这是复数旋转 x * i 的实数域实现
+        实现复数旋转的辅助函数,将向量旋转 90 度。
+
+        将输入张量的最后一维切分为两半 [x1, x2],返回 [-x2, x1]。
+        这对应于复数乘法 x * i 在实数域的表示:
+        - 如果 x = x1 + i*x2,则 x * i = -x2 + i*x1
+
+        参数:
+            x: 输入张量,最后一维的大小必须是偶数
+
+        返回:
+            旋转后的张量,形状与输入相同
         """
-        x1 = x[..., :x.shape[-1]//2]
-        x2 = x[..., x.shape[-1]//2:]
+        # 将最后一维切分为前半部分和后半部分
+        x1 = x[..., :x.shape[-1]//2] # 前半部分: 维度 [0, dim/2)
+        x2 = x[..., x.shape[-1]//2:] # 后半部分: 维度 [dim/2, dim)
+        # 拼接 [-x2, x1] 实现 90 度旋转
         return torch.cat([-x2, x1], dim=-1)
 
-    # 调整 cos/sin 形状以支持广播
-    # 假设 q 是 [B, Seq, Head, Dim]，cos 是 [Seq, Dim]
-    # unsqueeze(1) 后 cos 变成 [Seq, 1, Dim]，可以广播到 Head 维度
+    # --- 步骤 1: 调整 cos/sin 的形状以支持广播 ---
+    # 输入: q/k 形状为 [Batch, Seq_Len, Head, Dim]
+    #       cos/sin 形状为 [Seq_Len, Dim]
+    # 目标: 使 cos/sin 能够广播到 q/k 的所有维度
+    #
+    # 在 unsqueeze_dim=1 处插入维度:
+    #   [Seq_Len, Dim] -> [Seq_Len, 1, Dim]
+    # 广播后自动扩展为:
+    #   [Seq_Len, 1, Dim] -> [Batch, Seq_Len, Head, Dim]
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
 
-    # 核心旋转公式:
-    # x_rot = (x * cos) + (rotate_half(x) * sin)
+    # --- 步骤 2: 应用旋转变换 ---
+    # RoPE 的核心公式 (复数形式):
+    #   q_rot = q * e^(i*theta) = q * (cos(theta) + i*sin(theta))
+    #
+    # 在实数域展开为:
+    #   q_rot = q * cos(theta) + (q 旋转 90°) * sin(theta)
+    #         = q * cos + rotate_half(q) * sin
+    #
+    # 这样每个位置的向量都会根据其位置索引进行不同角度的旋转,
+    # 从而将位置信息隐式地编码到向量表示中
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     
