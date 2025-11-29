@@ -355,14 +355,51 @@ def repeat_kv(
     n_rep:int
 )->torch.Tensor:
     """
+    重复键值(K/V)张量以支持分组查询注意力 (Grouped Query Attention, GQA)。
+
+    在 GQA 中,K 和 V 的头数少于 Q 的头数,需要将每个 K/V 头复制多次以匹配 Q 的头数。
+    例如:
+    - 如果 Q 有 32 个头,K/V 有 8 个头,则 n_rep = 32 / 8 = 4
+    - 每个 K/V 头会被复制 4 次,使得总头数从 8 变为 32
+
+    这种设计的优势:
+    - 减少 K/V 缓存的内存占用 (KV Cache)
+    - 保持模型表达能力的同时降低计算成本
+    - 在长序列生成时显著节省显存
+
+    参数:
+        x: 输入的 K 或 V 张量,形状 (Batch, Seq_Len, num_key_value_heads, head_dim)
+        n_rep: 每个 K/V 头需要重复的次数,等于 num_attention_heads / num_key_value_heads
+
+    返回:
+        重复后的张量,形状 (Batch, Seq_Len, num_key_value_heads * n_rep, head_dim)
+        其中 num_key_value_heads * n_rep = num_attention_heads
     """
-    bs,slen,num_key_value_heads,head_dim = x.shape
+    # 解构输入张量的形状
+    bs, slen, num_key_value_heads, head_dim = x.shape
+
+    # 优化: 如果不需要重复 (标准多头注意力 MHA),直接返回原张量
     if n_rep == 1:
         return x
-    
-    return (x[:,:,:,None,:]
-            .expand(bs,slen,num_key_value_heads,n_rep,head_dim)
-            .reshape(bs,slen,num_key_value_heads*n_rep,head_dim))
+
+    # --- 重复操作的三个步骤 ---
+    # 步骤 1: 在第 3 维插入新维度 (None 等价于 unsqueeze)
+    #   形状变化: [bs, slen, num_kv_heads, head_dim]
+    #         -> [bs, slen, num_kv_heads, 1, head_dim]
+    #
+    # 步骤 2: 在新维度上扩展 n_rep 次 (expand 不复制数据,仅改变视图)
+    #   形状变化: [bs, slen, num_kv_heads, 1, head_dim]
+    #         -> [bs, slen, num_kv_heads, n_rep, head_dim]
+    #
+    # 步骤 3: 重塑为目标形状 (reshape 会触发实际的内存复制)
+    #   形状变化: [bs, slen, num_kv_heads, n_rep, head_dim]
+    #         -> [bs, slen, num_kv_heads * n_rep, head_dim]
+    #
+    # 效果: 每个 K/V 头被连续复制 n_rep 次
+    # 例如: [h0, h1] 重复 3 次 -> [h0, h0, h0, h1, h1, h1]
+    return (x[:, :, :, None, :]
+            .expand(bs, slen, num_key_value_heads, n_rep, head_dim)
+            .reshape(bs, slen, num_key_value_heads * n_rep, head_dim))
 
 
 class Attention(nn.Module):
