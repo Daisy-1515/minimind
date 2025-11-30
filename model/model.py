@@ -499,16 +499,24 @@ class Attention(nn.Module):
         # 应用 RoPE 位置编码
         cos , sin = position_embeddings
         xq,xk = apply_rotary_pos_emb(xq,xk,cos[:seq_len],sin[:seq_len])
-        # 对于k和v，进行重复以匹配q的头数
+        
+        # KV 缓存机制：拼接历史缓存与当前计算的 key/value
         if past_K_V is not None:
             past_k,past_v = past_K_V
+            # 拼接历史 key 缓存：
+            # past_k [bsz, past_seq_len, n_local_kv_heads, head_dim] + xk [bsz, seq_len, n_local_kv_heads, head_dim]
+            # 结果 xk 维度：
+            # [bsz, past_seq_len + seq_len, n_local_kv_heads, head_dim]
             xk = torch.cat([past_k,xk],dim=1)
+            # 拼接历史 value 缓存：
+            # past_v [bsz, past_seq_len, n_local_kv_heads, head_dim] + xv [bsz, seq_len, n_local_kv_heads, head_dim]
+            # 结果 xv 维度：[bsz, past_seq_len + seq_len, n_local_kv_heads, head_dim]
             xv = torch.cat([past_v,xv],dim=1)
+        
         
         past_key_value = (xk,xv) if use_cache else None
         
         xq,xk,xv = (
-            
             xq.transpose(1,2),  # [bsz, n_heads, seq_len, head_dim]
             repeat_kv(xk,self.n_rep).transpose(1,2),  
             repeat_kv(xv,self.n_rep).transpose(1,2)   # (B, Heads, Seq, Head_Dim)
@@ -551,6 +559,8 @@ class Attention(nn.Module):
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             scores = self.attn_dropout(scores)
             output = scores @ xv
+            
+            
         # bsz,seq_len,n_heads,head_dim
         output=output.transpose(1,2).reshape(bsz,seq_len,-1)
         output=self.resid_dropout(self.o_proj(output))
