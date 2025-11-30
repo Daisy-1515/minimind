@@ -400,6 +400,9 @@ def repeat_kv(
     return (x[:, :, :, None, :]
             .expand(bs, slen, num_key_value_heads, n_rep, head_dim)
             .reshape(bs, slen, num_key_value_heads * n_rep, head_dim))
+# ==========================================
+# 4. 注意力机制
+# ==========================================
 
 
 class Attention(nn.Module):
