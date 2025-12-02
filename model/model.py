@@ -29,9 +29,9 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 # Hugging Face Transformers 库
-from transformers import GenerationMixin, PreTrainedModel, PretrainedConfig
+from transformers import ClvpForCausalLM, GenerationMixin, PreTrainedModel, PretrainedConfig
 from transformers.activations import ACT2FN  # 激活函数映射字典 {"silu": SiLU(), "gelu": GELU(), ...}
-
+from transformers.modeling_outputs import CausalLMOutputWithPast
 # 类型注解
 from typing import Optional, Tuple, List, Union
 
@@ -785,17 +785,7 @@ class MokioMindModel(nn.Module):
     
         
         
-        
 
-        
-        
-        
-        
-    
-    
-    
-    
-    
     
 class MokioMindForCausalLM(PreTrainedModel,GenerationMixin): #hug定义的标准类
     config_class = MokioMindConfig
@@ -807,127 +797,44 @@ class MokioMindForCausalLM(PreTrainedModel,GenerationMixin): #hug定义的标准
         
         self.model = MokioMindModel(config)
         
+        self.lm_head = nn.Linear(
+            self.config.hidden_size,
+            self.config.vocab_size,
+            bias=False
+        )
+        # 共享嵌入权重``
+        self.model.embed_tokens.weight = self.lm_head.weight
+        
+        self.OUT = CausalLMOutputWithPast()
+        
+    def forward(
+        self,
+        input_ids:Optional[torch.Tensor]=None,
+        attention_mask:Optional[torch.Tensor]=None,
+        past_key_values:Optional[List[Optional[Tuple[torch.Tensor, torch.Tensor]]]]=None,
+        use_cache:bool = False,
+        logits_to_keep:Union[int,torch.Tensor]=0,
+        **kwargs
+    )->CausalLMOutputWithPast:
+        hidden_states , past_key_values = self.model(
+            input_ids = input_ids,
+            attention_mask = attention_mask,
+            past_key_values = past_key_values,
+            use_cache = use_cache,
+            **kwargs
+        )
+        slice_indices = (
+            slice(-logits_to_keep, None)
+            if isinstance(logits_to_keep, int) 
+            else logits_to_keep
+        )
+        logits = self.lm_head(hidden_states)[..., slice_indices, :]
+        
+        self.OUT.__setitem__("last_hidden_state",hidden_states)
+        self.OUT.__setitem__("logits",logits)
+        self.OUT.__setitem__("past_key_values",past_key_values)
+        
+        return self.OUT
         
         
-    
-    
-    
-    
         
-
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-# class Attention(nn.Module):
-#     def __init__(self, args: MokioMindConfig):
-#         super().__init__()
-
-#         # --- 1. 初始化 KV 头数配置 (GQA 核心逻辑) ---
-#         # 逻辑：如果配置中未指定 num_key_value_heads (即为 None)，则默认它等于 num_attention_heads。
-#         # 效果：
-#         #   - 如果相等：退化为标准的 Multi-Head Attention (MHA)。
-#         #   - 如果不等（通常更小）：启用 Grouped Query Attention (GQA)。
-#         self.num_key_value_heads = args.num_attention_heads if args.num_key_value_heads is None else args.num_key_value_heads
-        
-#         # --- 2. 维度检查 [优化] ---
-#         # 检查 1: 隐藏层维度必须能被 Q 头数整除，算出 head_dim
-#         assert args.hidden_size % args.num_attention_heads == 0, "hidden_size must be divisible by num_attention_heads"
-#         # 检查 2: Q 头数必须能被 KV 头数整除 (这是 GQA 分组的前提)
-#         assert args.num_attention_heads % self.num_key_value_heads == 0, "num_attention_heads must be divisible by num_key_value_heads"
-       
-#         # --- 3. 核心参数设置 ---
-#         # Query (Q) 的头数
-#         self.n_local_heads = args.num_attention_heads
-        
-#         # Key/Value (K/V) 的头数
-#         self.n_local_kv_heads = self.num_key_value_heads
-        
-#         # 【关键点】计算重复次数 (Repetition Factor)
-#         # 含义：每个 KV 头对应多少个 Q 头。
-#         # 作用：在 forward 阶段，KV 需要在第 2 维度上复制 n_rep 次，以对齐 Q 的形状进行计算。
-#         self.n_rep = self.n_local_heads // self.n_local_kv_heads
-        
-#         # 计算每个头的维度 (head_dim)
-#         self.head_dim = args.hidden_size // args.num_attention_heads
-        
-#         # --- 4. 定义线性投影层 (Linear Layers) ---
-#         # Q 的投影层：输出维度 = 总头数 * 头维度
-#         self.q_proj = nn.Linear(args.hidden_size, self.n_local_heads * self.head_dim, bias=False)
-        
-#         # K, V 的投影层：输出维度 = KV头数 * 头维度
-#         # [GQA优势]：当 n_local_kv_heads < n_local_heads 时，这里的参数量大幅减少。
-#         self.k_proj = nn.Linear(args.hidden_size, self.n_local_kv_heads * self.head_dim, bias=False)
-#         self.v_proj = nn.Linear(args.hidden_size, self.n_local_kv_heads * self.head_dim, bias=False)
-        
-#         # 输出投影层
-#         self.o_proj = nn.Linear(args.hidden_size, args.hidden_size, bias=False) 
-        
-#         # --- 5. Dropout 设置 [修复 Bug] ---
-#         # 原代码 bug：self.dropout 先被赋值为 nn.Dropout 对象，下一行又被赋值为 float 数值。
-#         # 修复：将概率值存为不同的变量名 (如 dropout_p)，避免覆盖 nn.Module。
-#         self.dropout = nn.Dropout(args.dropout)       # 这是一个 Layer (nn.Module)
-#         self.resid_dropout = nn.Dropout(args.dropout) # 这是一个 Layer
-#         self.dropout_p = args.dropout                 # [修复] 这是一个 float 数值，用于 functional 调用
-        
-#         # --- 6. Flash Attention 配置 [修复逻辑] ---
-#         # 原代码 bug：末尾多了一个 `and args`，这在 Python 中总是 True (对象本身)，没有意义且容易引起误解。
-#         # 修复：移除末尾多余部分。
-#         self.flash_attention = (
-#             args.flash_attention and 
-#             hasattr(torch.nn.functional, "scaled_dot_product_attention")
-#         )
