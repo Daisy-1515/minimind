@@ -29,9 +29,10 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 # Hugging Face Transformers 库
-from transformers import ClvpForCausalLM, GenerationMixin, PreTrainedModel, PretrainedConfig
+from transformers import  GenerationMixin, PreTrainedModel, PretrainedConfig
 from transformers.activations import ACT2FN  # 激活函数映射字典 {"silu": SiLU(), "gelu": GELU(), ...}
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.cache_utils import DynamicCache  # KV 缓存工具类
 # 类型注解
 from typing import Optional, Tuple, List, Union
 
@@ -614,12 +615,8 @@ class FeedForward(nn.Module):
         前向传播：SwiGLU 激活
         公式：dropout(down(act(up(x)) * gate(x)))
         """
-        return self.dropout(
-            self.down_proj(
-                self.act_fn(self.up_proj(x)) * self.gate_proj(x)
-            )
-        )
-
+        gated = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+        return self.dropout(self.down_proj(gated))
 class MokioMindBlock(nn.Module):
     def __init__(self, layer_id:int ,config:MokioMindConfig):
         super().__init__()
@@ -676,6 +673,7 @@ class MokioMindBlock(nn.Module):
 class MokioMindModel(nn.Module):
     def __init__(self, config:MokioMindConfig):
         super().__init__()
+        self.config = config
         self.vocab_size , self.num_hidden_layers = (
             config.vocab_size,
             config.num_hidden_layers
@@ -764,13 +762,13 @@ class MokioMindModel(nn.Module):
         # ):
 
         # 修复：重命名循环变量避免覆盖外部变量，使用类型安全的列表
-        for layer_idx , (layer , past_kv) in enumerate(
+        for layer_idx , (layer , past_key_value) in enumerate(
             zip(self.layers , past_key_values_list)
         ):
             hidden_states , present = layer(
                 hidden_states,
                 position_embeddings,
-                past_key_value = past_kv,  # 修复：使用正确的参数名
+                past_key_value = past_key_value,  # 修复：使用正确的参数名
                 use_cache = use_cache,
                 attention_mask = attention_mask,
             )
@@ -783,9 +781,6 @@ class MokioMindModel(nn.Module):
         return hidden_states , presents
     
     
-        
-        
-
     
 class MokioMindForCausalLM(PreTrainedModel,GenerationMixin): #hug定义的标准类
     config_class = MokioMindConfig
@@ -805,7 +800,7 @@ class MokioMindForCausalLM(PreTrainedModel,GenerationMixin): #hug定义的标准
         # 共享嵌入权重``
         self.model.embed_tokens.weight = self.lm_head.weight
         
-        self.OUT = CausalLMOutputWithPast()
+       
         
     def forward(
         self,
@@ -825,16 +820,22 @@ class MokioMindForCausalLM(PreTrainedModel,GenerationMixin): #hug定义的标准
         )
         slice_indices = (
             slice(-logits_to_keep, None)
-            if isinstance(logits_to_keep, int) 
+            if isinstance(logits_to_keep, int)
             else logits_to_keep
         )
         logits = self.lm_head(hidden_states)[..., slice_indices, :]
-        
-        self.OUT.__setitem__("last_hidden_state",hidden_states)
-        self.OUT.__setitem__("logits",logits)
-        self.OUT.__setitem__("past_key_values",past_key_values)
-        
-        return self.OUT
-        
-        
-        
+
+        # 将 List[Tuple[Tensor, Tensor]] 转换为 DynamicCache 类型
+        cache = None
+        if past_key_values is not None and use_cache:
+            cache = DynamicCache()
+            for layer_idx, layer_kv in enumerate(past_key_values):
+                if layer_kv is not None:
+                    # DynamicCache.update 方法签名: update(key_states, value_states, layer_idx)
+                    cache.update(layer_kv[0], layer_kv[1], layer_idx)
+
+        return CausalLMOutputWithPast(
+            logits = logits,
+            past_key_values = cache,
+            hidden_states = hidden_states
+        )
